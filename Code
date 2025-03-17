@@ -468,5 +468,359 @@ if __name__ == "__main__":
         metrics = compute_cell_metrics(gfp_img, nuclei_mask, nucleoli_mask)[0]  # using nuclei metrics as example
         # Here, we simply collect the metrics dictionary for each image (you can modify as needed)
         all_metrics_list.append(deepcopy(metrics))
+
+# Flatten lists of sizes and intensities from the results dictionary
+all_nucleoli_sizes = [size for sizes in results['nucleoli_sizes'] for size in sizes]
+all_nuclei_sizes = [size for sizes in results['nuclei_sizes'] for size in sizes]
+all_nucleoli_intensities = [val for vals in results['nucleoli_intensities'] for val in vals]
+all_nuclei_intensities = [val for vals in results['nuclei_intensities'] for val in vals]
+
+# Create subplots for size (left) and intensity (right)
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+# 1) SIZE DISTRIBUTION
+axes[0].hist(all_nucleoli_sizes, bins=30, alpha=0.5, label='Nucleoli')
+axes[0].hist(all_nuclei_sizes, bins=30, alpha=0.5, label='Nuclei')
+
+mean_nucleoli_size = np.mean(all_nucleoli_sizes) if len(all_nucleoli_sizes) > 0 else 0
+mean_nuclei_size   = np.mean(all_nuclei_sizes)   if len(all_nuclei_sizes)   > 0 else 0
+
+# Vertical lines at means
+axes[0].axvline(mean_nucleoli_size, color='blue', linestyle='dashed', linewidth=2)
+axes[0].axvline(mean_nuclei_size,   color='orange', linestyle='dashed', linewidth=2)
+
+axes[0].legend()
+axes[0].set_title('Size Distribution')
+axes[0].set_xlabel('Area (pixels)')
+axes[0].set_ylabel('Count')
+
+# 2) INTENSITY DISTRIBUTION
+axes[1].hist(all_nucleoli_intensities, bins=30, alpha=0.5, label='Nucleoli')
+axes[1].hist(all_nuclei_intensities, bins=30, alpha=0.5, label='Nuclei')
+
+mean_nucleoli_intensity = np.mean(all_nucleoli_intensities) if len(all_nucleoli_intensities) > 0 else 0
+mean_nuclei_intensity   = np.mean(all_nuclei_intensities)   if len(all_nuclei_intensities)   > 0 else 0
+
+# Vertical lines at means
+axes[1].axvline(mean_nucleoli_intensity, color='blue',   linestyle='dashed', linewidth=2)
+axes[1].axvline(mean_nuclei_intensity,   color='orange', linestyle='dashed', linewidth=2)
+
+axes[1].legend()
+axes[1].set_title('Intensity Distribution')
+axes[1].set_xlabel('Mean Intensity')
+axes[1].set_ylabel('Count')
+
+plt.tight_layout()
+plt.show()
+
+import os
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage import io, measure, morphology, segmentation, feature
+from skimage.filters import threshold_multiotsu
+import scipy.ndimage as ndimage
+import pandas as pd
+
+########################################
+#            Helper Functions          #
+########################################
+
+def normalize(im):
+    return (im - im.min()) / (im.max() - im.min())
+
+def gamma_correction(im, gamma):
+    return normalize(im) ** gamma
+
+def remove_large_nuclei(labels, max_size_factor=2.5):
+    """
+    For each labeled nucleus, if its area is larger than
+    max_size_factor * average_area, remove it (set to 0).
+    """
+    props = measure.regionprops(labels)
+    if not props:
+        return labels
     
-    # (Additional combined plotting can be added here if desired.)
+    areas = [p.area for p in props]
+    avg_area = np.mean(areas)
+    max_allowed_area = max_size_factor * avg_area
+
+    new_labels = np.zeros_like(labels, dtype=np.int32)
+    new_id = 0
+    for region in props:
+        if region.area <= max_allowed_area:
+            new_id += 1
+            new_labels[labels == region.label] = new_id
+    return new_labels
+
+def segment_binary(im, min_size=10):
+    """Labels a binary mask, removes small objects, and clears borders."""
+    labeled = measure.label(im)
+    labeled = morphology.remove_small_objects(labeled, min_size=min_size)
+    labeled = segmentation.clear_border(labeled)
+    return measure.label(labeled > 0)
+
+########################################
+#    Nucleoli + Nuclei Segmentation    #
+########################################
+
+def segment_nucleoli_and_nuclei(
+    gfp_image, 
+    gamma=1.0, 
+    max_size_factor=2.5, 
+    nuclei_sensitivity=0.9, 
+    nucleoli_sensitivity=0.95
+):
+    """
+    1. Multi-threshold => background, nuclei, nucleoli.
+    2. Use watershed to separate touching nuclei, then remove oversized lumps.
+    3. Lower the threshold slightly for dim cells, and dilate nuclei to capture them.
+    4. Nucleoli are thresholded at a slightly lower boundary for sensitivity.
+    5. One nucleolus per nucleus is enforced.
+    """
+    img_proc = gamma_correction(gfp_image, gamma)
+    t1, t2 = threshold_multiotsu(img_proc, classes=3)
+    
+    # Nuclei segmentation
+    nuclei_bin = (img_proc > (t1 * nuclei_sensitivity))
+    nuclei_bin = ndimage.binary_fill_holes(nuclei_bin)
+    nuclei_bin = morphology.dilation(nuclei_bin, morphology.disk(1))
+    
+    distance = ndimage.distance_transform_edt(nuclei_bin)
+    coords = feature.peak_local_max(distance, labels=nuclei_bin, footprint=np.ones((3,3)))
+    mask_local_max = np.zeros_like(distance, dtype=bool)
+    mask_local_max[tuple(coords.T)] = True
+    markers = measure.label(mask_local_max)
+    nuclei_ws = segmentation.watershed(-distance, markers, mask=nuclei_bin)
+    nuclei_ws = segmentation.clear_border(nuclei_ws)
+    nuclei_ws = measure.label(morphology.remove_small_objects(nuclei_ws, 10) > 0)
+    nuclei_ws = remove_large_nuclei(nuclei_ws, max_size_factor=max_size_factor)
+    
+    # Nucleoli segmentation
+    nucleoli_bin = (img_proc > (t2 * nucleoli_sensitivity))
+    nucleoli_mask = segment_binary(nucleoli_bin, min_size=5)
+    nucleoli_mask = morphology.dilation(nucleoli_mask, morphology.disk(2))
+    nucleoli_mask = measure.label(nucleoli_mask > 0)
+    
+    # Match each nucleus with its largest nucleolus
+    final_nuclei = np.zeros_like(nuclei_ws, dtype=np.int32)
+    final_nucleoli = np.zeros_like(nucleoli_mask, dtype=np.int32)
+    nucleus_id = 0
+    for region in measure.regionprops(nuclei_ws, intensity_image=img_proc):
+        mask_nucleus = (nuclei_ws == region.label)
+        overlap_labels = np.unique(nucleoli_mask[mask_nucleus])
+        overlap_labels = overlap_labels[overlap_labels > 0]
+        if len(overlap_labels) > 0:
+            best_label, best_area = None, 0
+            for lab in overlap_labels:
+                area = np.sum(nucleoli_mask == lab)
+                if area > best_area:
+                    best_area = area
+                    best_label = lab
+            nucleus_id += 1
+            final_nuclei[mask_nucleus] = nucleus_id
+            final_nucleoli[nucleoli_mask == best_label] = nucleus_id
+    return final_nucleoli, final_nuclei
+
+def compute_cell_metrics(gfp_img, nuclei_mask, nucleoli_mask):
+    """
+    Compute properties for each cell based on final segmentation masks.
+    Returns two dictionaries keyed by cell id.
+    """
+    nuclei_regions = measure.regionprops(nuclei_mask, intensity_image=gfp_img)
+    nucleoli_regions = measure.regionprops(nucleoli_mask, intensity_image=gfp_img)
+    
+    nucleus_metrics = {}
+    nucleolus_metrics = {}
+    
+    for region in nuclei_regions:
+        cell_id = region.label
+        area = region.area
+        mean_intensity = region.mean_intensity
+        integrated_intensity = mean_intensity * area
+        intensities = [gfp_img[tuple(coord)] for coord in region.coords]
+        intensity_std = np.std(intensities)
+        cv = intensity_std / mean_intensity if mean_intensity > 0 else 0
+        eccentricity = region.eccentricity
+        solidity = region.solidity
+        perimeter = region.perimeter if region.perimeter > 0 else np.sqrt(area * 4 * np.pi)
+        circularity = (4 * np.pi * area) / (perimeter**2) if perimeter > 0 else 0
+        centroid = region.centroid
+        nucleus_metrics[cell_id] = {
+            'area': area,
+            'mean_intensity': mean_intensity,
+            'integrated_intensity': integrated_intensity,
+            'intensity_std': intensity_std,
+            'cv': cv,
+            'eccentricity': eccentricity,
+            'solidity': solidity,
+            'circularity': circularity,
+            'centroid': centroid
+        }
+    for region in nucleoli_regions:
+        cell_id = region.label
+        area = region.area
+        mean_intensity = region.mean_intensity
+        integrated_intensity = mean_intensity * area
+        intensities = [gfp_img[tuple(coord)] for coord in region.coords]
+        intensity_std = np.std(intensities)
+        cv = intensity_std / mean_intensity if mean_intensity > 0 else 0
+        eccentricity = region.eccentricity
+        solidity = region.solidity
+        perimeter = region.perimeter if region.perimeter > 0 else np.sqrt(area * 4 * np.pi)
+        circularity = (4 * np.pi * area) / (perimeter**2) if perimeter > 0 else 0
+        centroid = region.centroid
+        nucleolus_metrics[cell_id] = {
+            'area': area,
+            'mean_intensity': mean_intensity,
+            'integrated_intensity': integrated_intensity,
+            'intensity_std': intensity_std,
+            'cv': cv,
+            'eccentricity': eccentricity,
+            'solidity': solidity,
+            'circularity': circularity,
+            'centroid': centroid
+        }
+    return nucleus_metrics, nucleolus_metrics
+
+def get_metrics_dict(gfp_img, nuclei_mask, nucleoli_mask):
+    """
+    Calls compute_cell_metrics and extracts lists of metrics.
+    Returns a dictionary with keys mapping to lists.
+    """
+    nucleus_metrics, nucleolus_metrics = compute_cell_metrics(gfp_img, nuclei_mask, nucleoli_mask)
+    common_ids = sorted(list(set(nucleus_metrics.keys()) & set(nucleolus_metrics.keys())))
+
+    metrics = {
+        'nucleus_area': [],
+        'nucleolus_area': [],
+        'nucleus_mean_intensity': [],
+        'nucleolus_mean_intensity': [],
+        'nucleus_eccentricity': [],
+        'nucleus_solidity': [],
+        'nucleus_circularity': [],
+        'nucleolus_eccentricity': [],
+        'nucleolus_solidity': [],
+        'nucleolus_circularity': []
+    }
+    
+    for i in common_ids:
+        metrics['nucleus_area'].append(nucleus_metrics[i]['area'])
+        metrics['nucleolus_area'].append(nucleolus_metrics[i]['area'])
+        metrics['nucleus_mean_intensity'].append(nucleus_metrics[i]['mean_intensity'])
+        metrics['nucleolus_mean_intensity'].append(nucleolus_metrics[i]['mean_intensity'])
+        metrics['nucleus_eccentricity'].append(nucleus_metrics[i]['eccentricity'])
+        metrics['nucleus_solidity'].append(nucleus_metrics[i]['solidity'])
+        metrics['nucleus_circularity'].append(nucleus_metrics[i]['circularity'])
+        metrics['nucleolus_eccentricity'].append(nucleolus_metrics[i]['eccentricity'])
+        metrics['nucleolus_solidity'].append(nucleolus_metrics[i]['solidity'])
+        metrics['nucleolus_circularity'].append(nucleolus_metrics[i]['circularity'])
+
+    return metrics
+
+########################################
+#    Plot Only the Requested Outputs   #
+########################################
+
+def plot_requested_metrics(metrics):
+    # 1) Nuclei eccentricity, solidity, circularity
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    axes[0].hist(metrics['nucleus_eccentricity'], bins=20, color='green')
+    axes[0].set_title('Nucleus Eccentricity')
+    axes[0].set_xlabel('Eccentricity')
+    
+    axes[1].hist(metrics['nucleus_solidity'], bins=20, color='orange')
+    axes[1].set_title('Nucleus Solidity')
+    axes[1].set_xlabel('Solidity')
+    
+    axes[2].hist(metrics['nucleus_circularity'], bins=20, color='purple')
+    axes[2].set_title('Nucleus Circularity')
+    axes[2].set_xlabel('Circularity')
+    plt.tight_layout()
+    plt.show()
+    
+    # 2) Nucleoli eccentricity, solidity, circularity
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    axes[0].hist(metrics['nucleolus_eccentricity'], bins=20, color='green')
+    axes[0].set_title('Nucleolus Eccentricity')
+    axes[0].set_xlabel('Eccentricity')
+    
+    axes[1].hist(metrics['nucleolus_solidity'], bins=20, color='orange')
+    axes[1].set_title('Nucleolus Solidity')
+    axes[1].set_xlabel('Solidity')
+    
+    axes[2].hist(metrics['nucleolus_circularity'], bins=20, color='purple')
+    axes[2].set_title('Nucleolus Circularity')
+    axes[2].set_xlabel('Circularity')
+    plt.tight_layout()
+    plt.show()
+    
+    # 3) Nucleus area vs nucleolus area
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.scatter(metrics['nucleus_area'], metrics['nucleolus_area'], color='black', alpha=0.7)
+    ax.set_title('Nucleus Area vs Nucleolus Area')
+    ax.set_xlabel('Nucleus Area')
+    ax.set_ylabel('Nucleolus Area')
+    plt.tight_layout()
+    plt.show()
+    
+    # 4) Nucleolus vs nucleus mean intensity
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.scatter(metrics['nucleus_mean_intensity'], metrics['nucleolus_mean_intensity'], color='darkgreen', alpha=0.7)
+    ax.set_title('Nucleus Mean Intensity vs Nucleolus Mean Intensity')
+    ax.set_xlabel('Nucleus Mean Intensity')
+    ax.set_ylabel('Nucleolus Mean Intensity')
+    plt.tight_layout()
+    plt.show()
+
+########################################
+#                Main                  #
+########################################
+
+if __name__ == "__main__":
+    # We'll loop through images from GFP_02.tif to GFP_11.tif
+    all_metrics_list = []
+    for i in range(2, 12):
+        gfp_image_path = f"GFP_{i:02d}.tif"
+        nuclei_mask_path = os.path.join("segmentation_results", f"nuclei_mask_{i}.npy")
+        nucleoli_mask_path = os.path.join("segmentation_results", f"nucleoli_mask_{i}.npy")
+        
+        print(f"Processing image: {gfp_image_path}")
+        if not os.path.exists(gfp_image_path):
+            print(f"{gfp_image_path} not found.")
+            continue
+        if not os.path.exists(nuclei_mask_path):
+            print(f"{nuclei_mask_path} not found.")
+            continue
+        if not os.path.exists(nucleoli_mask_path):
+            print(f"{nucleoli_mask_path} not found.")
+            continue
+        
+        gfp_img = io.imread(gfp_image_path)
+        nuclei_mask = np.load(nuclei_mask_path)
+        nucleoli_mask = np.load(nucleoli_mask_path)
+        
+        # Compute metrics without showing individual plots.
+        metrics = get_metrics_dict(gfp_img, nuclei_mask, nucleoli_mask)
+        all_metrics_list.append(metrics)
+    
+    # Combine metrics across all images
+    if len(all_metrics_list) == 0:
+        print("No images processed, nothing to plot.")
+    else:
+        combined_metrics = {}
+        keys = all_metrics_list[0].keys()
+        for key in keys:
+            combined_metrics[key] = []
+            for m in all_metrics_list:
+                combined_metrics[key].extend(m[key])
+        
+        # Plot only the requested metrics
+        plot_requested_metrics(combined_metrics)
+        
+        # Save combined metrics to a single CSV file.
+        df = pd.DataFrame(combined_metrics)
+        output_csv = "combined_aggregated_metrics.csv"
+        df.to_csv(output_csv, index=False)
+        print(f"Combined aggregated metrics saved to {output_csv}")
+
